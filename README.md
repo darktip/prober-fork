@@ -1,5 +1,7 @@
 # prober
 
+## Web app available https://fusionfpv.com/prober
+
 Native CLI + GUI tool for flashing and configuring Bluejay ESC firmware over BLHeli 4-way passthrough (MSP). Supports single ESCs, 4-in-1 boards, and AIOs. Also includes a C2 flashing mode for direct SiLabs programming via Arduino.
 
 Built in C++ with no runtime dependencies. Ships as a single portable binary (CLI) or Qt-based GUI.
