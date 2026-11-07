@@ -156,6 +156,19 @@ bool FourWay::reset_esc(int idx0, ResetMode mode) {
   return false;
 }
 
+// Betaflight reads the hardware-reboot flag from the command address, not
+// from the optional second parameter used by other 4-way implementations.
+bool FourWay::reboot_betaflight_esc(int channel) {
+  if (channel < 0 || channel > 255 || iface_name().find("m4wFCIntf") == std::string::npos) return false;
+  try {
+    uint8_t ack = 0xFF;
+    cmd(CMD_DeviceReset, 1, {static_cast<uint8_t>(channel)}, &ack);
+    return ack == ACK_OK;
+  } catch (...) {
+    return false;
+  }
+}
+
 bool FourWay::reset_selected(ResetMode mode) {
   return reset_esc(last_selected_idx0_, mode);
 }

@@ -83,6 +83,7 @@ public:
   void reset_target(uint8_t target);
   bool reset_esc(int idx0, ResetMode mode = ResetMode::ExitBootloader);
   bool reset_selected(ResetMode mode = ResetMode::ExitBootloader);
+  bool reboot_betaflight_esc(int channel);
   int last_selected_idx0() const { return last_selected_idx0_; }
   bool last_selection_ok() const { return last_selection_ok_; }
   void clear_reset_cache() { reset_cap_known_ = false; }

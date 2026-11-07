@@ -88,7 +88,7 @@ public:
   std::optional<int> enter_passthrough();
   bool bringup_4way();
 
-  MspRestoreResult exit_passthrough_and_restore_msp(int timeout_ms = 5000);
+  MspRestoreResult exit_passthrough_and_restore_msp(int timeout_ms = 5000, bool reset_selected = true);
 
   bool flash_one(int esc_index_0based,
                  const std::string& hex_path,

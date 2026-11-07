@@ -840,8 +840,8 @@ int main(int argc, char** argv){
                 std::string("{\"type\":\"passthrough_info\",\"esc_count\":") + std::to_string(esc_count) + "}");
   }
 
-  auto exit_passthrough = [&]() -> MspRestoreResult {
-    auto result = fl.exit_passthrough_and_restore_msp(5000);
+  auto exit_passthrough = [&](bool reset_selected = true) -> MspRestoreResult {
+    auto result = fl.exit_passthrough_and_restore_msp(5000, reset_selected);
     ndjson_emit(args.ui_json,
                 std::string("{\"type\":\"msp_restore\",\"ok\":") + (result.ok ? "true" : "false") +
                 ",\"attempts\":" + std::to_string(result.attempts) +
@@ -878,18 +878,75 @@ int main(int argc, char** argv){
   };
   int total = esc_count>0? esc_count : 8;
 
+  // The FC's reported channel count does not indicate whether the ESCs are
+  // powered. Bound initial detection before the more extensive mapping retries.
+  if (!args.probe_escs && !args.probe_sweep) {
+    log.info("Checking for ESCs (timeout: 5 seconds)...");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    const double previous_timeout = fw.get_timeout();
+    const double previous_probe_sleep = fw.get_probe_sleep();
+    fw.set_probe_sleep(0);
+    bool found = false;
+    bool wake_attempted = false;
+    int value = 0;
+    const int max_value = std::min(total, 255);
+    while (std::chrono::steady_clock::now() < deadline) {
+      const double remaining = std::chrono::duration<double>(deadline - std::chrono::steady_clock::now()).count();
+      if (remaining <= 0) break;
+      fw.set_timeout(std::min(1.0, remaining));
+      // A connected ESC can be left in a state in which it ignores repeated
+      // init requests. Try one Betaflight channel reboot within the same
+      // five-second budget; an unpowered ESC still fails at the deadline.
+      if (!wake_attempted && remaining < 4.0 && remaining > 1.5) {
+        wake_attempted = true;
+        if (fw.reboot_betaflight_esc(0)) {
+          log.info("No ESC response yet; rebooted channel 0 and retrying...");
+        }
+      }
+      auto sig = fw.diagnostic_init_flash_index_val(static_cast<uint8_t>(value), 1);
+      if (sig.has_value()) {
+        // Reset the raw channel just selected, independently of mapping mode.
+        fw.reset_esc(value, ResetMode::ExitBootloader);
+        found = true;
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      value = value == max_value ? 0 : value + 1;
+    }
+    fw.set_timeout(previous_timeout);
+    fw.set_probe_sleep(previous_probe_sleep);
+    if (!found) {
+      log.info("No ESCs responded within 5 seconds. Check ESC and battery connections.");
+      exit_passthrough(false);
+      return 1;
+    }
+    log.info("ESC detected; continuing.");
+  }
+
   auto direct_warmup = [&](int idx0) -> bool {
     uint16_t direct = (uint16_t)(0x0004u + (uint16_t)(idx0 & 0xFF));
     SelectionReport drep;
     auto dsig = fw.diagnostic_init_flash_direct(direct, 1, &drep);
     if (dsig.has_value()) {
-      fw.reset_selected(ResetMode::ExitBootloader);
+      fw.reset_esc(idx0, ResetMode::ExitBootloader);
       std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     return dsig.has_value();
   };
 
   auto recover_index_from_direct = [&](int idx0) -> bool {
+    if (mapping_mode == MappingMode::STRICT_0_BASED || mapping_mode == MappingMode::STRICT_1_BASED) {
+      const int channel = idx0 + (mapping_mode == MappingMode::STRICT_1_BASED ? 1 : 0);
+      if (fw.reboot_betaflight_esc(channel)) {
+        log.info("ESC" + std::to_string(idx0 + 1) + ": rebooting unresponsive channel before retry");
+        std::this_thread::sleep_for(std::chrono::milliseconds(700));
+        SelectionReport report;
+        if (fw.select_target_session(idx0, mapping_mode, false, 1, 4, &report)) {
+          fw.reset_selected(ResetMode::ExitBootloader);
+          return true;
+        }
+      }
+    }
     uint16_t direct = (uint16_t)(0x0004u + (uint16_t)(idx0 & 0xFF));
 
     // Attempt 1: direct kick → reset → reselect by index
@@ -900,7 +957,7 @@ int main(int argc, char** argv){
         log.info("recover-direct: esc=" + std::to_string(idx0 + 1) + " direct_ok=no");
         return false;
       }
-      fw.reset_selected(ResetMode::ExitBootloader);
+      fw.reset_esc(idx0, ResetMode::ExitBootloader);
       std::this_thread::sleep_for(std::chrono::milliseconds(150));
 
       SelectionReport srep;
@@ -934,7 +991,7 @@ int main(int argc, char** argv){
       SelectionReport drep2;
       auto dsig2 = fw.diagnostic_init_flash_direct(direct, 2, &drep2);
       if (dsig2.has_value()) {
-        fw.reset_selected(ResetMode::ExitBootloader);
+        fw.reset_esc(idx0, ResetMode::ExitBootloader);
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
       }
 
@@ -962,7 +1019,7 @@ int main(int argc, char** argv){
       SelectionReport rep;
       auto sig = fw.diagnostic_init_flash_index_val((uint8_t)v, 1, &rep);
       if (sig.has_value()) {
-        fw.reset_selected(ResetMode::ExitBootloader);
+        fw.reset_esc(v, ResetMode::ExitBootloader);
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         log.info("warm-up: val=" + std::to_string(v) + " ok (sig=0x" +
                  [&](){ char b[8]; snprintf(b,8,"%04X", *sig); return std::string(b); }() + ")");
@@ -973,7 +1030,7 @@ int main(int argc, char** argv){
       SelectionReport rep;
       auto sig = fw.diagnostic_init_flash_index_val((uint8_t)v, 1, &rep);
       if (sig.has_value()) {
-        fw.reset_selected(ResetMode::ExitBootloader);
+        fw.reset_esc(v, ResetMode::ExitBootloader);
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         log.info("warm-up: val=" + std::to_string(v) + " ok (sig=0x" +
                  [&](){ char b[8]; snprintf(b,8,"%04X", *sig); return std::string(b); }() + ")");
@@ -1237,7 +1294,7 @@ int main(int argc, char** argv){
       std::string sigs = "--";
       if (ssig.has_value()) { char b[8]; snprintf(b,8,"%04X", *ssig); sigs = std::string("0x") + b; }
       log.info("probe-sweep: val="+std::to_string(v)+" ok="+(ssig.has_value()?"yes":"no")+" sig="+sigs+" tries="+std::to_string(srep.attempts));
-      if (ssig.has_value()) { fw.reset_selected(ResetMode::ExitBootloader); }
+      if (ssig.has_value()) { fw.reset_esc(v, ResetMode::ExitBootloader); }
       std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
   }
@@ -1369,17 +1426,13 @@ int main(int argc, char** argv){
 
       std::vector<int> success_rounds(total, 0);
       std::vector<int> attempted_rounds(total, 0);
+      std::vector<std::optional<ReadRowFull>> read_results(total);
 
       std::vector<int> pending;
       pending.reserve(end_idx - start_idx);
       for (int i = start_idx; i < end_idx; ++i) {
         if (!reachable.empty() && !reachable[i]) {
-          log.info("ESC" + std::to_string(i + 1) + ": read skipped (unreachable)");
-          ndjson_emit(args.ui_json,
-                      std::string("{\"type\":\"esc_read_summary\",\"esc_index\":") + std::to_string(i + 1) +
-                      ",\"success_rounds\":0,\"total_rounds\":" + std::to_string(rounds) +
-                      ",\"stable\":false,\"skipped\":true}");
-          continue;
+          log.info("ESC" + std::to_string(i + 1) + ": initial probe failed; attempting read recovery");
         }
         pending.push_back(i);
       }
@@ -1402,7 +1455,7 @@ int main(int argc, char** argv){
           }
           if (ok && rr.ok) {
             success_rounds[i]++;
-            print_row(i, rr);
+            read_results[i] = rr;
             read_any_ok = true;
             ndjson_emit(args.ui_json,
                         std::string("{\"type\":\"esc_read_ok\",\"esc_index\":") + std::to_string(i + 1) +
@@ -1465,7 +1518,7 @@ int main(int argc, char** argv){
       }
 
       for (int i = start_idx; i < end_idx; ++i) {
-        if (!reachable.empty() && !reachable[i]) continue;  // already emitted above
+        if (read_results[i].has_value()) print_row(i, *read_results[i]);
         bool stable = (success_rounds[i] == attempted_rounds[i]) && (success_rounds[i] > 0);
         ndjson_emit(args.ui_json,
                     std::string("{\"type\":\"esc_read_summary\",\"esc_index\":") + std::to_string(i + 1) +
@@ -1744,12 +1797,12 @@ int main(int argc, char** argv){
           for (int v = 0; v < esc_count; ++v) {
             SelectionReport vr;
             auto vs = fw.diagnostic_init_flash_index_val((uint8_t)v, 1, &vr);
-            if (vs.has_value()) { fw.reset_selected(ResetMode::ExitBootloader); }
+            if (vs.has_value()) { fw.reset_esc(v, ResetMode::ExitBootloader); }
           }
           if (esc_count > 0) {
             SelectionReport vr;
             auto vs = fw.diagnostic_init_flash_index_val((uint8_t)esc_count, 1, &vr);
-            if (vs.has_value()) { fw.reset_selected(ResetMode::ExitBootloader); }
+            if (vs.has_value()) { fw.reset_esc(esc_count, ResetMode::ExitBootloader); }
           }
           std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }

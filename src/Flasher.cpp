@@ -45,7 +45,7 @@ std::optional<int> Flasher::enter_passthrough(){
   return std::nullopt;
 }
 
-MspRestoreResult Flasher::exit_passthrough_and_restore_msp(int timeout_ms) {
+MspRestoreResult Flasher::exit_passthrough_and_restore_msp(int timeout_ms, bool reset_selected) {
   MspRestoreResult result;
   auto t0 = std::chrono::steady_clock::now();
   auto elapsed = [&]() -> int {
@@ -55,7 +55,7 @@ MspRestoreResult Flasher::exit_passthrough_and_restore_msp(int timeout_ms) {
 
   log_.info("Exiting 4-way interface...");
   for (int i = 0; i < 5; ++i) {
-    fw_.reset_selected();
+    if (reset_selected) fw_.reset_selected();
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     if (fw_.exit_interface()) {
       log_.info("4-way exit OK (attempt " + std::to_string(i + 1) + ")");
@@ -152,12 +152,22 @@ bool Flasher::bringup_4way(){
 }
 
 bool Flasher::select_index_only(int idx, int tries, SelectionReport* out){
-  return fw_.select_target_session(idx,
-                                  mapping_mode,
-                                  /*allow_alt_addresses=*/false,
-                                  /*direct_attempts=*/std::max(1, tries),
-                                  /*index_attempts=*/std::max(1, tries),
-                                  out);
+  auto select = [&]() {
+    return fw_.select_target_session(idx,
+                                     mapping_mode,
+                                     /*allow_alt_addresses=*/false,
+                                     /*direct_attempts=*/std::max(1, tries),
+                                     /*index_attempts=*/std::max(1, tries),
+                                     out);
+  };
+  if (select()) return true;
+  // Only a resolved strict mapping identifies a channel safe to reboot.
+  if (mapping_mode != MappingMode::STRICT_0_BASED && mapping_mode != MappingMode::STRICT_1_BASED) return false;
+  const int channel = idx + (mapping_mode == MappingMode::STRICT_1_BASED ? 1 : 0);
+  if (!fw_.reboot_betaflight_esc(channel)) return false;
+  log_.info("ESC" + std::to_string(idx + 1) + ": rebooting unresponsive channel before retry");
+  std::this_thread::sleep_for(std::chrono::milliseconds(700));
+  return select();
 }
 
 bool Flasher::select_settings_target(int idx, int index_tries, int direct_tries, SelectionReport* out) {
@@ -212,7 +222,9 @@ bool Flasher::read_block_with_recovery(int idx,
     return ms;
   };
 
+  bool selection_failed = false;
   auto try_read_once = [&](size_t chunk_size, SelectionReport* rep)->bool {
+    selection_failed = false;
     std::vector<uint8_t> data;
     data.reserve(len);
 
@@ -223,6 +235,7 @@ bool Flasher::read_block_with_recovery(int idx,
       sel_ok = select_index_only(idx, std::max(2, probe_tries), rep);
     }
     if (!sel_ok) {
+      selection_failed = true;
       return false;
     }
 
@@ -256,12 +269,15 @@ bool Flasher::read_block_with_recovery(int idx,
         bool resel_ok = allow_alt_addressing
           ? select_settings_target(idx, std::max(2, probe_tries), /*direct_tries=*/2, &r2)
           : select_index_only(idx, std::max(2, probe_tries), &r2);
-        if (resel_ok) {
+        if (!resel_ok) {
           *rep = r2;
-          uint16_t sb = eeprom_base_for(rep->sig.value_or(0));
-          if (sb != 0) actual_base = sb;
-          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+          selection_failed = true;
+          return false;
         }
+        *rep = r2;
+        uint16_t sb = eeprom_base_for(rep->sig.value_or(0));
+        if (sb != 0) actual_base = sb;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
       }
 
       if (!got_chunk) {
@@ -285,6 +301,7 @@ bool Flasher::read_block_with_recovery(int idx,
   }
   chunk_sizes.push_back(16);
 
+  int failed_selections = 0;
   for (size_t chunk_size : chunk_sizes) {
     for (int attempt = 0; attempt < 5; ++attempt) {
       SelectionReport rep;
@@ -294,6 +311,12 @@ bool Flasher::read_block_with_recovery(int idx,
       }
       if (last_rep) *last_rep = rep;
 
+      // Smaller read chunks cannot fix a failed ESC selection. Allow one
+      // reset and retry, then let the caller move on to its next read round.
+      if (selection_failed && ++failed_selections >= 2) {
+        log_.info("ESC" + std::to_string(idx + 1) + ": selection failed after recovery attempts");
+        return false;
+      }
       fw_.reset_esc(idx);
       std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms(attempt)));
     }
@@ -1069,7 +1092,7 @@ bool Flasher::read_settings_full(int idx, ReadRowFull* out, bool allow_alt_addre
 bool Flasher::read_settings_page(int idx, uint16_t base, size_t len, std::vector<uint8_t>* out) {
   SelectionReport rep;
   std::vector<uint8_t> data;
-  if (!read_block_with_recovery(idx, base, len, /*chunk_max=*/256, &data, &rep)) {
+  if (!read_block_with_recovery(idx, base, len, /*chunk_max=*/256, &data, &rep, /*allow_alt_addressing=*/false)) {
     log_.info("read_settings_page: read failed for ESC" + std::to_string(idx + 1));
     return false;
   }
@@ -1079,7 +1102,7 @@ bool Flasher::read_settings_page(int idx, uint16_t base, size_t len, std::vector
 
 bool Flasher::write_settings_page(int idx, uint16_t base, const std::vector<uint8_t>& page) {
   SelectionReport rep;
-  bool ok = select_settings_target(idx, /*index_tries=*/std::max(2, probe_tries), /*direct_tries=*/2, &rep);
+  bool ok = select_index_only(idx, std::max(2, probe_tries), &rep);
   if (!ok) {
     log_.info("write_settings_page: select failed for ESC" + std::to_string(idx + 1));
     return false;
@@ -1119,7 +1142,10 @@ bool Flasher::write_settings_page(int idx, uint16_t base, const std::vector<uint
       fw_.reset_esc(idx);
       std::this_thread::sleep_for(std::chrono::milliseconds(30));
       SelectionReport srep;
-      (void)select_settings_target(idx, /*index_tries=*/std::max(2, probe_tries), /*direct_tries=*/2, &srep);
+      if (!select_index_only(idx, std::max(2, probe_tries), &srep)) {
+        log_.info("write_settings_page: reselect failed for ESC" + std::to_string(idx + 1));
+        return false;
+      }
     }
     if (!wrote) {
       log_.info("write_settings_page: write failed @0x" + [&](){ char b[8]; snprintf(b, 8, "%04X", (uint16_t)(base + off)); return std::string(b); }());
@@ -1136,7 +1162,7 @@ bool Flasher::update_settings(int idx, const SettingsPatch& patch, BluejaySettin
 
   // 1) Select and get signature
   SelectionReport rep;
-  bool ok = select_settings_target(idx, /*index_tries=*/std::max(2, probe_tries), /*direct_tries=*/2, &rep);
+  bool ok = select_index_only(idx, std::max(2, probe_tries), &rep);
   if (!ok) {
     log_.info("update_settings: select failed");
     return false;
