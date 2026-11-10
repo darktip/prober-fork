@@ -3,6 +3,7 @@
 #include "esctool/BluejaySettings.h"
 #include "esctool/Utils.h"
 #include <thread>
+#include <chrono>
 #include <algorithm>
 #include <functional>
 
@@ -151,6 +152,66 @@ bool Flasher::bringup_4way(){
   return true;
 }
 
+void Flasher::reboot_all_and_sweep() {
+  const bool one_based = mapping_mode == MappingMode::STRICT_1_BASED;
+  const int first_channel = one_based ? 1 : 0;
+  const int count = std::min(esc_count, 256 - first_channel);
+  if (count <= 0) return;
+
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  const double old_timeout = fw_.get_timeout();
+  const double old_probe_sleep = fw_.get_probe_sleep();
+  fw_.set_probe_sleep(0);
+  auto set_remaining_timeout = [&](double maximum) {
+    const double remaining = std::chrono::duration<double>(
+        deadline - std::chrono::steady_clock::now()).count();
+    if (remaining <= 0) return false;
+    fw_.set_timeout(std::min(maximum, remaining));
+    return true;
+  };
+
+  log_.info("ESC recovery: rebooting all channels and sweeping reads (timeout reset to 5 seconds)...");
+  for (int offset = 0; offset < count && set_remaining_timeout(0.5); ++offset) {
+    const int channel = first_channel + offset;
+    const bool acknowledged = fw_.reboot_betaflight_esc(channel);
+    log_.info("ESC recovery: reboot channel " + std::to_string(channel) +
+              (acknowledged ? " acknowledged" : " not acknowledged"));
+  }
+  const auto remaining = deadline - std::chrono::steady_clock::now();
+  if (remaining > std::chrono::steady_clock::duration::zero()) {
+    std::this_thread::sleep_for(std::min(
+        remaining, std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                       std::chrono::milliseconds(700))));
+  }
+  int selected = 0;
+  int reads = 0;
+  for (int offset = 0; offset < count && set_remaining_timeout(0.5); ++offset) {
+    const int channel = first_channel + offset;
+    auto sig = fw_.diagnostic_init_flash_index_val(static_cast<uint8_t>(channel), 1);
+    if (!sig) continue;
+    ++selected;
+    if (set_remaining_timeout(0.5)) {
+      auto data = fw_.read(eeprom_base_for(*sig), 8, 1);
+      if (data.size() == 8) ++reads;
+      log_.info("ESC recovery: channel " + std::to_string(channel) +
+                (data.size() == 8 ? " read OK" : " read failed"));
+    }
+    if (set_remaining_timeout(0.3)) fw_.reset_esc(channel, ResetMode::ExitBootloader);
+  }
+  fw_.set_timeout(old_timeout);
+  fw_.set_probe_sleep(old_probe_sleep);
+  log_.info("ESC recovery sweep: selected " + std::to_string(selected) +
+            ", read " + std::to_string(reads) + ".");
+}
+
+int Flasher::reset_channel_for_index(int idx) const {
+  if (mapping_mode == MappingMode::STRICT_1_BASED) return idx + 1;
+  if (mapping_mode == MappingMode::STRICT_0_BASED) return idx;
+  if (fw_.last_selection_ok() && fw_.last_selected_idx0() == idx &&
+      fw_.last_mapping_used() == "1-based") return idx + 1;
+  return idx;
+}
+
 bool Flasher::select_index_only(int idx, int tries, SelectionReport* out){
   auto select = [&]() {
     return fw_.select_target_session(idx,
@@ -165,18 +226,28 @@ bool Flasher::select_index_only(int idx, int tries, SelectionReport* out){
     log_.trace("ESC" + std::to_string(idx + 1) + ": index selection failed; attempts=" +
                std::to_string(out ? out->attempts : 0) + " mapping=" + std::to_string(static_cast<int>(mapping_mode)));
   }
-  // Only a resolved strict mapping identifies a channel safe to reboot.
+  // A resolved strict mapping is required before rebooting named channels.
   if (mapping_mode != MappingMode::STRICT_0_BASED && mapping_mode != MappingMode::STRICT_1_BASED) return false;
   const int channel = idx + (mapping_mode == MappingMode::STRICT_1_BASED ? 1 : 0);
-  if (!fw_.reboot_betaflight_esc(channel)) return false;
-  log_.info("ESC" + std::to_string(idx + 1) + ": rebooting unresponsive channel before retry");
-  std::this_thread::sleep_for(std::chrono::milliseconds(700));
-  const bool recovered = select();
-  if (log_.want(LogLevel::TRACE)) {
-    log_.trace("ESC" + std::to_string(idx + 1) + ": selection after reboot=" +
-               (recovered ? "success" : "failed") + " attempts=" + std::to_string(out ? out->attempts : 0));
+  if (fw_.reboot_betaflight_esc(channel)) {
+    log_.info("ESC" + std::to_string(idx + 1) + ": rebooting unresponsive channel before retry");
+    std::this_thread::sleep_for(std::chrono::milliseconds(700));
+    const bool recovered = select();
+    if (log_.want(LogLevel::TRACE)) {
+      log_.trace("ESC" + std::to_string(idx + 1) + ": selection after reboot=" +
+                 (recovered ? "success" : "failed") + " attempts=" + std::to_string(out ? out->attempts : 0));
+    }
+    if (recovered) return true;
   }
-  return recovered;
+
+  // Run at most one all-channel recovery per target in this process. Retrying
+  // selection afterwards does not repeat a settings or firmware write.
+  if (esc_count <= 0 || std::find(sweep_attempted_for_.begin(), sweep_attempted_for_.end(), idx) != sweep_attempted_for_.end()) return false;
+  sweep_attempted_for_.push_back(idx);
+  log_.info("ESC" + std::to_string(idx + 1) + ": selection still failed; starting all-channel recovery");
+  reboot_all_and_sweep();
+  log_.info("ESC" + std::to_string(idx + 1) + ": retrying selection after all-channel recovery");
+  return select();
 }
 
 bool Flasher::select_settings_target(int idx, int index_tries, int direct_tries, SelectionReport* out) {
@@ -271,7 +342,7 @@ bool Flasher::read_block_with_recovery(int idx,
                      " chunk_try=" + std::to_string(ct + 1) + "/3");
         }
 
-        fw_.reset_esc(idx);
+        fw_.reset_esc(reset_channel_for_index(idx));
         std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms(ct)));
 
         SelectionReport r2;
@@ -326,7 +397,7 @@ bool Flasher::read_block_with_recovery(int idx,
         log_.info("ESC" + std::to_string(idx + 1) + ": selection failed after recovery attempts");
         return false;
       }
-      fw_.reset_esc(idx);
+      fw_.reset_esc(reset_channel_for_index(idx));
       std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms(attempt)));
     }
   }
@@ -619,7 +690,7 @@ bool Flasher::flash_one(int idx, const std::string& hex_path, VerifyMode verify_
         log_.info("DRY RUN: would update settings page");
       }
     }
-    fw_.reset_esc(idx); std::this_thread::sleep_for(std::chrono::milliseconds(20)); log_.info("ESC" + std::to_string(idx+1) + " reset");
+    fw_.reset_esc(reset_channel_for_index(idx)); std::this_thread::sleep_for(std::chrono::milliseconds(20)); log_.info("ESC" + std::to_string(idx+1) + " reset");
     return true;
   }
 
@@ -630,7 +701,7 @@ bool Flasher::flash_one(int idx, const std::string& hex_path, VerifyMode verify_
     if (is_bb51){
       log_.info("DRY RUN: BB51 protected ranges: boot=[0x" + [&](){ char b[8]; snprintf(b,8,"%04X", m->bootloader_address); return std::string(b);}() + "..0x" + [&](){ char b[8]; snprintf(b,8,"%04X", (uint16_t)flash_end_excl); return std::string(b);}() + ") lock=0x" + [&](){ char b[8]; snprintf(b,8,"%04X", m->lockbyte_address); return std::string(b);}() + " sig=0x" + [&](){ char b[8]; snprintf(b,8,"%04X", (uint16_t)(m->lockbyte_address-1)); return std::string(b);}());
     }
-    fw_.reset_esc(idx); std::this_thread::sleep_for(std::chrono::milliseconds(20)); log_.info("ESC" + std::to_string(idx+1) + " reset");
+    fw_.reset_esc(reset_channel_for_index(idx)); std::this_thread::sleep_for(std::chrono::milliseconds(20)); log_.info("ESC" + std::to_string(idx+1) + " reset");
     return true;
   }
 
@@ -981,7 +1052,7 @@ bool Flasher::flash_one(int idx, const std::string& hex_path, VerifyMode verify_
               result.insert(result.end(), chunk.begin(), chunk.end());
               got_it = true;
             } else {
-              fw_.reset_esc(idx);
+              fw_.reset_esc(reset_channel_for_index(idx));
               int backoff = 30 * (attempt + 1);
               std::this_thread::sleep_for(std::chrono::milliseconds(backoff));
               SelectionReport rrep;
@@ -1001,7 +1072,7 @@ bool Flasher::flash_one(int idx, const std::string& hex_path, VerifyMode verify_
 
         // Chunk size failed entirely; try smaller
         if (cs > chunk_sizes.back()) {
-          fw_.reset_esc(idx);
+          fw_.reset_esc(reset_channel_for_index(idx));
           std::this_thread::sleep_for(std::chrono::milliseconds(50));
           SelectionReport rrep;
           (void)fw_.select_target_session(idx, mapping_mode,
@@ -1047,7 +1118,7 @@ bool Flasher::flash_one(int idx, const std::string& hex_path, VerifyMode verify_
     log_.info("Verify: off");
   }
 
-  fw_.reset_esc(idx); std::this_thread::sleep_for(std::chrono::milliseconds(20)); log_.info("ESC" + std::to_string(idx+1) + " reset");
+  fw_.reset_esc(reset_channel_for_index(idx)); std::this_thread::sleep_for(std::chrono::milliseconds(20)); log_.info("ESC" + std::to_string(idx+1) + " reset");
   return true;
 }
 
@@ -1076,7 +1147,7 @@ bool Flasher::read_settings_full(int idx, ReadRowFull* out, bool allow_alt_addre
     BluejaySettings s{};
     BluejaySettingsDisplay d{};
     if (!bj_parse_identity(raw, &id) || !bj_parse_settings(raw, id, &s) || !bj_make_display(s, id, &d)) {
-      fw_.reset_esc(idx);
+      fw_.reset_esc(reset_channel_for_index(idx));
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
       continue;
     }
@@ -1148,7 +1219,7 @@ bool Flasher::write_settings_page(int idx, uint16_t base, const std::vector<uint
         wrote = true;
         break;
       }
-      fw_.reset_esc(idx);
+      fw_.reset_esc(reset_channel_for_index(idx));
       std::this_thread::sleep_for(std::chrono::milliseconds(30));
       SelectionReport srep;
       if (!select_index_only(idx, std::max(2, probe_tries), &srep)) {
@@ -1240,7 +1311,7 @@ bool Flasher::update_settings(int idx, const SettingsPatch& patch, BluejaySettin
     bj_make_display(s2, id2, after);
   }
 
-  fw_.reset_esc(idx);
+  fw_.reset_esc(reset_channel_for_index(idx));
   std::this_thread::sleep_for(std::chrono::milliseconds(20));
   log_.info("ESC" + std::to_string(idx+1) + " reset");
   return true;

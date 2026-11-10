@@ -143,6 +143,7 @@ private:
   std::pair<uint16_t,std::vector<uint8_t>> cmd(uint8_t cmd, uint16_t addr, const std::vector<uint8_t>& params, uint8_t* ack_out);
 
   int last_selected_idx0_{0};
+  int last_selected_channel_{0}; // Raw channel value used for the successful selection.
   bool last_selection_ok_{false};
   uint16_t last_direct_addr_used_{0};
   bool last_select_used_scan_{false};

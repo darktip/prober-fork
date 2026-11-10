@@ -8,6 +8,7 @@
 #include "esctool/BluejaySettings.h"
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace esctool {
 
@@ -51,6 +52,9 @@ struct ReadRowFull {
 
 class Flasher {
   ISerial& ser_; MSP& msp_; FourWay& fw_; Log& log_;
+  std::vector<int> sweep_attempted_for_;
+  void reboot_all_and_sweep();
+  int reset_channel_for_index(int esc_index_0based) const;
   bool select_index_only(int esc_index_0based, int tries, SelectionReport* out);
   bool select_settings_target(int esc_index_0based, int index_tries, int direct_tries, SelectionReport* out);
   bool read_block_with_recovery(int esc_index_0based,
@@ -61,6 +65,7 @@ class Flasher {
                                SelectionReport* last_rep,
                                bool allow_alt_addressing = true);
 public:
+  int    esc_count{0};
   int    probe_tries{6};
   double probe_sleep{0.15};
   MappingMode mapping_mode{MappingMode::AUTO};

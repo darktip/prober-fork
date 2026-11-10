@@ -241,7 +241,7 @@ bool FourWay::reboot_betaflight_esc(int channel) {
 }
 
 bool FourWay::reset_selected(ResetMode mode) {
-  return reset_esc(last_selected_idx0_, mode);
+  return reset_esc(last_selected_channel_, mode);
 }
 
 bool FourWay::select_target_session(int idx0,
@@ -261,8 +261,9 @@ bool FourWay::select_target_session(int idx0,
     mode = *auto_mapping_locked_;
   }
 
-  auto set_ok = [&](const std::optional<uint16_t>& sig){
+  auto set_ok = [&](const std::optional<uint16_t>& sig, int selected_channel){
     last_selected_idx0_ = idx0;
+    last_selected_channel_ = selected_channel;
     last_selection_ok_ = true;
     if (out) { out->ok = true; out->sig = sig; }
     return true;
@@ -333,7 +334,7 @@ bool FourWay::select_target_session(int idx0,
         last_direct_addr_used_ = direct;
         if (out) { out->used_direct = true; out->direct_addr = direct; }
         std::this_thread::sleep_for(std::chrono::milliseconds(15));
-        return set_ok(sig);
+        return set_ok(sig, idx0);
       }
       sleep_probe(a);
     }
@@ -361,7 +362,7 @@ bool FourWay::select_target_session(int idx0,
         last_mapping_used_ = map_s;
         if (out) { out->used_index = true; out->index_val = val; out->index_mapping = map_s; }
         std::this_thread::sleep_for(std::chrono::milliseconds(15));
-        return set_ok(sig);
+        return set_ok(sig, val);
       }
 
       if (ack == ACK_D_INVALID_CHANNEL) {
@@ -412,7 +413,7 @@ bool FourWay::select_target_session(int idx0,
         last_direct_addr_used_ = alt;
         if (out) { out->used_direct = true; out->direct_addr = alt; }
         std::this_thread::sleep_for(std::chrono::milliseconds(15));
-        return set_ok(sig);
+        return set_ok(sig, idx0);
       }
       sleep_probe(0);
     }

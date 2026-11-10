@@ -854,6 +854,7 @@ int main(int argc, char** argv){
   }
 
   auto esc_count_opt = fl.enter_passthrough(); if (!esc_count_opt.has_value()) return 1; int esc_count = esc_count_opt.value_or(-1);
+  fl.esc_count = esc_count;
   if (!fl.bringup_4way()) return 1;
 
   if (esc_count > 0) {
@@ -903,7 +904,8 @@ int main(int argc, char** argv){
   // powered. Bound initial detection before the more extensive mapping retries.
   if (!args.probe_escs && !args.probe_sweep) {
     log.info("Checking for ESCs (timeout: 5 seconds)...");
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    const auto started = std::chrono::steady_clock::now();
+    auto deadline = started + std::chrono::seconds(5);
     const double previous_timeout = fw.get_timeout();
     const double previous_probe_sleep = fw.get_probe_sleep();
     fw.set_probe_sleep(0);
@@ -911,23 +913,58 @@ int main(int argc, char** argv){
     bool wake_attempted = false;
     int value = 0;
     const int max_value = std::min(total, 255);
-    while (std::chrono::steady_clock::now() < deadline) {
-      const double remaining = std::chrono::duration<double>(deadline - std::chrono::steady_clock::now()).count();
-      if (remaining <= 0) break;
-      fw.set_timeout(std::min(1.0, remaining));
-      // A connected ESC can be left in a state in which it ignores repeated
-      // init requests. Try one Betaflight channel reboot within the same
-      // five-second budget; an unpowered ESC still fails at the deadline.
-      if (!wake_attempted && remaining < 4.0 && remaining > 1.5) {
+    // Keep every recovery transaction within the remaining detection budget.
+    auto set_remaining_timeout = [&](double max_timeout) {
+      const double remaining = std::chrono::duration<double>(
+          deadline - std::chrono::steady_clock::now()).count();
+      if (remaining <= 0) return false;
+      fw.set_timeout(std::min(max_timeout, remaining));
+      return true;
+    };
+    while (set_remaining_timeout(1.0)) {
+      // A valid response from the FC does not guarantee that the ESCs have
+      // entered their bootloaders. After repeated failed scans, ask the FC
+      // to reboot each possible channel, then try a read on each one.
+      if (!wake_attempted && std::chrono::steady_clock::now() >= started + std::chrono::seconds(1)) {
         wake_attempted = true;
-        if (fw.reboot_betaflight_esc(0)) {
-          log.info("No ESC response yet; rebooted channel 0 and retrying...");
+        deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        log.info("No ESC response yet; restarting the 5-second detection timeout, rebooting all channels and sweeping ESC reads...");
+        for (int channel = 0; channel <= max_value && set_remaining_timeout(0.5); ++channel) {
+          const bool acknowledged = fw.reboot_betaflight_esc(channel);
+          log.info("ESC recovery: reboot channel " + std::to_string(channel) +
+                   (acknowledged ? " acknowledged" : " not acknowledged"));
         }
+        const auto remaining = deadline - std::chrono::steady_clock::now();
+        if (remaining > std::chrono::steady_clock::duration::zero()) {
+          std::this_thread::sleep_for(std::min(
+              remaining, std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                             std::chrono::milliseconds(700))));
+        }
+        int sweep_selected = 0;
+        int sweep_read = 0;
+        for (int channel = 0; channel <= max_value && set_remaining_timeout(0.5); ++channel) {
+          auto sig = fw.diagnostic_init_flash_index_val(static_cast<uint8_t>(channel), 1);
+          if (!sig) continue;
+          ++sweep_selected;
+          if (set_remaining_timeout(0.5)) {
+            auto bytes = fw.read(eeprom_base_for(*sig), 8, 1);
+            if (bytes.size() == 8) ++sweep_read;
+            log.info("ESC recovery: channel " + std::to_string(channel) +
+                     (bytes.size() == 8 ? " read OK" : " read failed"));
+          }
+          if (set_remaining_timeout(0.3)) fw.reset_esc(channel, ResetMode::ExitBootloader);
+        }
+        log.info("ESC recovery sweep: selected " + std::to_string(sweep_selected) +
+                 ", read " + std::to_string(sweep_read) + ".");
+        if (sweep_selected > 0) { found = true; break; }
+        deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        log.info("ESC recovery sweep found no responding ESC; retrying detection for another 5 seconds...");
+        continue;
       }
       auto sig = fw.diagnostic_init_flash_index_val(static_cast<uint8_t>(value), 1);
       if (sig.has_value()) {
         // Reset the raw channel just selected, independently of mapping mode.
-        fw.reset_esc(value, ResetMode::ExitBootloader);
+        if (set_remaining_timeout(0.3)) fw.reset_esc(value, ResetMode::ExitBootloader);
         found = true;
         break;
       }
@@ -937,7 +974,7 @@ int main(int argc, char** argv){
     fw.set_timeout(previous_timeout);
     fw.set_probe_sleep(previous_probe_sleep);
     if (!found) {
-      log.info("No ESCs responded within 5 seconds. Check ESC and battery connections.");
+      log.info("No ESCs responded during detection and recovery. Check ESC and battery connections.");
       exit_passthrough(false);
       return 1;
     }
@@ -949,7 +986,7 @@ int main(int argc, char** argv){
     SelectionReport drep;
     auto dsig = fw.diagnostic_init_flash_direct(direct, 1, &drep);
     if (dsig.has_value()) {
-      fw.reset_esc(idx0, ResetMode::ExitBootloader);
+      fw.reset_esc(idx0 + (mapping_mode == MappingMode::STRICT_1_BASED ? 1 : 0), ResetMode::ExitBootloader);
       std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     return dsig.has_value();
@@ -978,7 +1015,7 @@ int main(int argc, char** argv){
         log.info("recover-direct: esc=" + std::to_string(idx0 + 1) + " direct_ok=no");
         return false;
       }
-      fw.reset_esc(idx0, ResetMode::ExitBootloader);
+      fw.reset_esc(idx0 + (mapping_mode == MappingMode::STRICT_1_BASED ? 1 : 0), ResetMode::ExitBootloader);
       std::this_thread::sleep_for(std::chrono::milliseconds(150));
 
       SelectionReport srep;
@@ -1012,7 +1049,7 @@ int main(int argc, char** argv){
       SelectionReport drep2;
       auto dsig2 = fw.diagnostic_init_flash_direct(direct, 2, &drep2);
       if (dsig2.has_value()) {
-        fw.reset_esc(idx0, ResetMode::ExitBootloader);
+        fw.reset_esc(idx0 + (mapping_mode == MappingMode::STRICT_1_BASED ? 1 : 0), ResetMode::ExitBootloader);
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
       }
 
