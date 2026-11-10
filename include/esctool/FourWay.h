@@ -6,6 +6,7 @@
 #include <optional>
 #include <utility>
 #include <string>
+#include <chrono>
 
 namespace esctool {
 // 4-way command IDs
@@ -67,9 +68,14 @@ struct SelectionReport {
   int attempts{0};
 };
 
+// Raised when the FC stops responding throughout the retry window.
+struct FourWayLinkLost {};
+
 class FourWay {
   ISerial& ser_; Log& log_; double timeout_s_; bool trace_; double inter_delay_s_;
   std::string last_mapping_used_;
+  std::optional<std::chrono::steady_clock::time_point> communication_failure_since_;
+  bool communication_retry_expired() const;
 public:
   FourWay(ISerial& s, Log& l, double timeout_s=1.0, bool trace=false, double inter_delay_s=0.0)
       : ser_(s), log_(l), timeout_s_(timeout_s), trace_(trace), inter_delay_s_(inter_delay_s) {}

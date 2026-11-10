@@ -161,13 +161,22 @@ bool Flasher::select_index_only(int idx, int tries, SelectionReport* out){
                                      out);
   };
   if (select()) return true;
+  if (log_.want(LogLevel::TRACE)) {
+    log_.trace("ESC" + std::to_string(idx + 1) + ": index selection failed; attempts=" +
+               std::to_string(out ? out->attempts : 0) + " mapping=" + std::to_string(static_cast<int>(mapping_mode)));
+  }
   // Only a resolved strict mapping identifies a channel safe to reboot.
   if (mapping_mode != MappingMode::STRICT_0_BASED && mapping_mode != MappingMode::STRICT_1_BASED) return false;
   const int channel = idx + (mapping_mode == MappingMode::STRICT_1_BASED ? 1 : 0);
   if (!fw_.reboot_betaflight_esc(channel)) return false;
   log_.info("ESC" + std::to_string(idx + 1) + ": rebooting unresponsive channel before retry");
   std::this_thread::sleep_for(std::chrono::milliseconds(700));
-  return select();
+  const bool recovered = select();
+  if (log_.want(LogLevel::TRACE)) {
+    log_.trace("ESC" + std::to_string(idx + 1) + ": selection after reboot=" +
+               (recovered ? "success" : "failed") + " attempts=" + std::to_string(out ? out->attempts : 0));
+  }
+  return recovered;
 }
 
 bool Flasher::select_settings_target(int idx, int index_tries, int direct_tries, SelectionReport* out) {

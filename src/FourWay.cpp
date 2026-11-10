@@ -2,6 +2,8 @@
 #include "esctool/Bluejay.h"
 #include "esctool/Utils.h"
 #include <thread>
+#include <algorithm>
+#include <chrono>
 #include <stdexcept>
 
 using namespace esctool;
@@ -16,8 +18,20 @@ void FourWay::tx(uint8_t cmd, uint16_t addr, const std::vector<uint8_t>& params_
   ser_.write(body.data(), body.size()); ser_.flush();
 }
 
+bool FourWay::communication_retry_expired() const {
+  return communication_failure_since_.has_value() &&
+         std::chrono::steady_clock::now() >= *communication_failure_since_ + std::chrono::seconds(5);
+}
+
 FourWay::Rx FourWay::rx(){
-  auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(timeout_s_);
+  const auto now = std::chrono::steady_clock::now();
+  double timeout = std::min(timeout_s_, 5.0);
+  if (communication_failure_since_) {
+    const double remaining = std::chrono::duration<double>(
+        *communication_failure_since_ + std::chrono::seconds(5) - now).count();
+    timeout = std::max(0.0, std::min(timeout, remaining));
+  }
+  auto deadline = now + std::chrono::duration<double>(timeout);
   auto rd = [&](size_t n){ std::vector<uint8_t> buf(n); size_t got=0; while(got<n && std::chrono::steady_clock::now()<deadline){ got += ser_.read(buf.data()+got, n-got);} buf.resize(got); return buf; };
   for(;;){
     // seek '.' start byte
@@ -58,12 +72,63 @@ FourWay::Rx FourWay::rx(){
 }
 
 std::pair<uint16_t,std::vector<uint8_t>> FourWay::cmd(uint8_t c, uint16_t a, const std::vector<uint8_t>& p, uint8_t* ack_out){
-  tx(c,a,p); auto r = rx(); if(r.cmd!=c) throw std::runtime_error("4-way echo mismatch"); if(ack_out) *ack_out = r.ack; return {r.addr, r.params};
+  // Keep trace volume bounded: capture only selection and reset transactions,
+  // never firmware/settings payloads.
+  const bool diagnostic = trace_ && (c == CMD_DeviceInitFlash || c == CMD_DeviceReset);
+  const auto started = std::chrono::steady_clock::now();
+  if (communication_retry_expired()) throw FourWayLinkLost{};
+  auto context = [&]() {
+    char cmd_text[5], addr_text[7];
+    snprintf(cmd_text, sizeof(cmd_text), "%02X", c);
+    snprintf(addr_text, sizeof(addr_text), "%04X", a);
+    return std::string("4-way diagnostic: cmd=0x") + cmd_text + " addr=0x" + addr_text +
+           " channel=" + (p.empty() ? std::string("none") : std::to_string(p[0]));
+  };
+  auto elapsed = [&]() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
+  };
+  if (diagnostic) log_.trace(context() + " sending");
+  try {
+    tx(c,a,p);
+    auto r = rx();
+    if (r.cmd != c) throw std::runtime_error("4-way echo mismatch");
+    if (ack_out) *ack_out = r.ack;
+    communication_failure_since_.reset();
+    if (diagnostic) {
+      char ack_text[5], addr_text[7];
+      snprintf(ack_text, sizeof(ack_text), "%02X", r.ack);
+      snprintf(addr_text, sizeof(addr_text), "%04X", r.addr);
+      std::string init_bytes;
+      if (c == CMD_DeviceInitFlash) {
+        for (size_t i = 0; i < r.params.size() && i < 4; ++i) {
+          char byte_text[4];
+          snprintf(byte_text, sizeof(byte_text), "%02X", r.params[i]);
+          if (!init_bytes.empty()) init_bytes += " ";
+          init_bytes += byte_text;
+        }
+      }
+      log_.trace(context() + " ack=0x" + ack_text + " (" + ack_name(r.ack) +
+                 ") response_addr=0x" + addr_text + " response_len=" + std::to_string(r.params.size()) +
+                 (init_bytes.empty() ? std::string() : " init_bytes=" + init_bytes) +
+                 " elapsed_ms=" + std::to_string(elapsed()));
+    }
+    return {r.addr, r.params};
+  } catch (const std::exception& e) {
+    if (!communication_failure_since_) communication_failure_since_ = started;
+    if (diagnostic) log_.trace(context() + " exception=" + e.what() + " elapsed_ms=" + std::to_string(elapsed()));
+    if (communication_retry_expired()) throw FourWayLinkLost{};
+    throw;
+  } catch (const FourWayLinkLost&) { throw; } catch (...) {
+    if (!communication_failure_since_) communication_failure_since_ = started;
+    if (diagnostic) log_.trace(context() + " unknown exception elapsed_ms=" + std::to_string(elapsed()));
+    if (communication_retry_expired()) throw FourWayLinkLost{};
+    throw;
+  }
 }
 
-bool FourWay::test_alive(){ uint8_t ack=0xFF; try{ cmd(CMD_InterfaceTestAlive,0,{0x00},&ack); return ack==ACK_OK; } catch(...) { return false; } }
-std::optional<uint8_t> FourWay::proto_ver(){ uint8_t ack=0xFF; try{ auto r=cmd(CMD_ProtocolGetVersion,0,{0x00},&ack); return (ack==ACK_OK && !r.second.empty())? std::optional<uint8_t>(r.second[0]):std::nullopt; } catch(...) { return std::nullopt; } }
-std::optional<std::pair<uint8_t,uint8_t>> FourWay::iface_ver(){ uint8_t ack=0xFF; try{ auto r=cmd(CMD_InterfaceGetVersion,0,{0x00},&ack); return (ack==ACK_OK && r.second.size()>=2)? std::make_optional(std::make_pair(r.second[0],r.second[1])):std::nullopt; } catch(...) { return std::nullopt; } }
+bool FourWay::test_alive(){ uint8_t ack=0xFF; try{ cmd(CMD_InterfaceTestAlive,0,{0x00},&ack); return ack==ACK_OK; } catch (const FourWayLinkLost&) { throw; } catch (...) { return false; } }
+std::optional<uint8_t> FourWay::proto_ver(){ uint8_t ack=0xFF; try{ auto r=cmd(CMD_ProtocolGetVersion,0,{0x00},&ack); return (ack==ACK_OK && !r.second.empty())? std::optional<uint8_t>(r.second[0]):std::nullopt; } catch (const FourWayLinkLost&) { throw; } catch (...) { return std::nullopt; } }
+std::optional<std::pair<uint8_t,uint8_t>> FourWay::iface_ver(){ uint8_t ack=0xFF; try{ auto r=cmd(CMD_InterfaceGetVersion,0,{0x00},&ack); return (ack==ACK_OK && r.second.size()>=2)? std::make_optional(std::make_pair(r.second[0],r.second[1])):std::nullopt; } catch (const FourWayLinkLost&) { throw; } catch (...) { return std::nullopt; } }
 std::string FourWay::iface_name(){
   if (!iface_name_cache_.empty()) return iface_name_cache_;
   uint8_t ack=0xFF;
@@ -71,13 +136,13 @@ std::string FourWay::iface_name(){
     auto r=cmd(CMD_InterfaceGetName,0,{0x00},&ack);
     iface_name_cache_ = (ack==ACK_OK)? std::string((char*)r.second.data(), r.second.size()) : std::string();
     return iface_name_cache_;
-  } catch(...) {
+  } catch (const FourWayLinkLost&) { throw; } catch (...) {
     return {};
   }
 }
-bool FourWay::set_mode_silabs(){ uint8_t ack=0xFF; try{ cmd(CMD_InterfaceSetMode,0,{0x01},&ack); return ack==ACK_OK; } catch(...) { return false; } }
-bool FourWay::exit_interface(){ uint8_t ack=0xFF; try{ cmd(CMD_InterfaceExit,0,{0x00},&ack); return ack==ACK_OK; } catch(...) { return false; } }
-void FourWay::reset_target(uint8_t t){ try{ uint8_t ack=0xFF; cmd(CMD_DeviceReset,0,{t},&ack); } catch(...) {} }
+bool FourWay::set_mode_silabs(){ uint8_t ack=0xFF; try{ cmd(CMD_InterfaceSetMode,0,{0x01},&ack); return ack==ACK_OK; } catch (const FourWayLinkLost&) { throw; } catch (...) { return false; } }
+bool FourWay::exit_interface(){ uint8_t ack=0xFF; try{ cmd(CMD_InterfaceExit,0,{0x00},&ack); return ack==ACK_OK; } catch (const FourWayLinkLost&) { throw; } catch (...) { return false; } }
+void FourWay::reset_target(uint8_t t){ try{ uint8_t ack=0xFF; cmd(CMD_DeviceReset,0,{t},&ack); } catch (const FourWayLinkLost&) { throw; } catch (...) {} }
 
 bool FourWay::reset_esc(int idx0, ResetMode mode) {
   uint8_t ch = (uint8_t)(idx0 & 0xFF);
@@ -103,7 +168,7 @@ bool FourWay::reset_esc(int idx0, ResetMode mode) {
           (reset_cap_==ResetCap::TWO_BYTE?"2byte":reset_cap_==ResetCap::ONE_BYTE?"1byte":"0byte") +
           ") mode=" + mode_str + " ch=" + std::to_string(idx0) + " ack=" + ack_name(ack));
         return ack == ACK_OK;
-      } catch (...) { return false; }
+      } catch (const FourWayLinkLost&) { throw; } catch (...) { return false; }
     };
     bool ok = try_cached();
     if (ok) return true;
@@ -146,7 +211,7 @@ bool FourWay::reset_esc(int idx0, ResetMode mode) {
       if (trace_) log_.trace(std::string("reset_esc: strategy=") + s.label +
         " mode=" + mode_str + " ch=" + std::to_string(idx0) + " ack=" + ack_name(ack));
       return false;
-    } catch (...) {
+    } catch (const FourWayLinkLost&) { throw; } catch (...) {
       if (trace_) log_.trace(std::string("reset_esc: strategy=") + s.label +
         " mode=" + mode_str + " ch=" + std::to_string(idx0) + " exception");
     }
@@ -163,8 +228,14 @@ bool FourWay::reboot_betaflight_esc(int channel) {
   try {
     uint8_t ack = 0xFF;
     cmd(CMD_DeviceReset, 1, {static_cast<uint8_t>(channel)}, &ack);
+    if (trace_) log_.trace("Betaflight channel reboot: channel=" + std::to_string(channel) +
+                           " ack=" + ack_name(ack) + " (acknowledgement does not confirm ESC readiness)");
     return ack == ACK_OK;
-  } catch (...) {
+  } catch (const std::exception& e) {
+    if (trace_) log_.trace("Betaflight channel reboot: channel=" + std::to_string(channel) + " exception=" + e.what());
+    return false;
+  } catch (const FourWayLinkLost&) { throw; } catch (...) {
+    if (trace_) log_.trace("Betaflight channel reboot: channel=" + std::to_string(channel) + " unknown exception");
     return false;
   }
 }
@@ -221,7 +292,7 @@ bool FourWay::select_target_session(int idx0,
         char b[8]; snprintf(b,8,"%04X", addr);
         log_.trace(std::string("select: initFlash exception addr=0x") + b + " what=" + e.what());
       }
-    } catch(...) {
+    } catch (const FourWayLinkLost&) { throw; } catch (...) {
       if (trace_) {
         char b[8]; snprintf(b,8,"%04X", addr);
         log_.trace(std::string("select: initFlash exception addr=0x") + b);
@@ -393,7 +464,7 @@ std::optional<uint16_t> FourWay::diagnostic_init_flash_direct(uint16_t addr,
         char b[8]; snprintf(b,8,"%04X", addr);
         log_.trace(std::string("diag: initFlash direct exception addr=0x") + b + " what=" + e.what());
       }
-    } catch(...) {
+    } catch (const FourWayLinkLost&) { throw; } catch (...) {
       if (trace_) {
         char b[8]; snprintf(b,8,"%04X", addr);
         log_.trace(std::string("diag: initFlash direct exception addr=0x") + b);
@@ -442,7 +513,7 @@ std::optional<uint16_t> FourWay::diagnostic_init_flash_index_val(uint8_t val,
       if (trace_) {
         log_.trace(std::string("diag: initFlash index exception val=") + std::to_string((int)val) + " what=" + e.what());
       }
-    } catch(...) {
+    } catch (const FourWayLinkLost&) { throw; } catch (...) {
       if (trace_) {
         log_.trace(std::string("diag: initFlash index exception val=") + std::to_string((int)val));
       }
@@ -485,7 +556,7 @@ std::vector<uint8_t> FourWay::read(uint16_t addr, int n, int retries){
                    " n=" + std::to_string(want_n) +
                    " err='" + e.what() + "'");
       }
-    } catch(...){
+    } catch (const FourWayLinkLost&) { throw; } catch (...){
       if (trace_) {
         char a0[8]; snprintf(a0,8,"%04X", addr);
         int want_n = (ln==0)?256:ln;
@@ -502,15 +573,15 @@ std::vector<uint8_t> FourWay::read(uint16_t addr, int n, int retries){
 
 bool FourWay::write(uint16_t addr, const std::vector<uint8_t>& data){
   std::vector<uint8_t> d = data.empty()? std::vector<uint8_t>{0x00} : data;
-  try{ uint8_t ack=0xFF; cmd(CMD_DeviceWrite, addr, d, &ack); return ack==ACK_OK; } catch(...) { return false; }
+  try{ uint8_t ack=0xFF; cmd(CMD_DeviceWrite, addr, d, &ack); return ack==ACK_OK; } catch (const FourWayLinkLost&) { throw; } catch (...) { return false; }
 }
 
 bool FourWay::erase_page(uint16_t page_index){
-  try{ uint8_t ack=0xFF; cmd(CMD_DevicePageErase, 0, { (uint8_t)(page_index & 0xFF) }, &ack); return ack==ACK_OK; } catch(...) { return false; }
+  try{ uint8_t ack=0xFF; cmd(CMD_DevicePageErase, 0, { (uint8_t)(page_index & 0xFF) }, &ack); return ack==ACK_OK; } catch (const FourWayLinkLost&) { throw; } catch (...) { return false; }
 }
 
 bool FourWay::erase_all(){
-  try{ uint8_t ack=0xFF; cmd(CMD_DeviceEraseAll, 0, {0x00}, &ack); return ack==ACK_OK; } catch(...) { return false; }
+  try{ uint8_t ack=0xFF; cmd(CMD_DeviceEraseAll, 0, {0x00}, &ack); return ack==ACK_OK; } catch (const FourWayLinkLost&) { throw; } catch (...) { return false; }
 }
 
 std::vector<uint8_t> FourWay::read_ee(uint16_t addr, int n){
@@ -518,7 +589,7 @@ std::vector<uint8_t> FourWay::read_ee(uint16_t addr, int n){
   try{
     uint8_t ack=0xFF; auto r = cmd(CMD_DeviceReadEE, addr, {ln}, &ack);
     if (ack==ACK_OK && r.first==addr) return r.second;
-  } catch(...) {}
+  } catch (const FourWayLinkLost&) { throw; } catch (...) {}
   return {};
 }
 
@@ -527,5 +598,5 @@ bool FourWay::write_ee(uint16_t addr, const std::vector<uint8_t>& data){
   try{
     uint8_t ack=0xFF; cmd(CMD_DeviceWriteEE, addr, d, &ack);
     return ack==ACK_OK;
-  } catch(...) { return false; }
+  } catch (const FourWayLinkLost&) { throw; } catch (...) { return false; }
 }

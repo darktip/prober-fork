@@ -8,10 +8,12 @@ namespace esctool {
 class SerialCSerialPort : public ISerial {
   std::unique_ptr<itas109::CSerialPort> s_;
   SerialOptions last_opts_;
+  std::string last_error_;
 public:
   SerialCSerialPort();
   ~SerialCSerialPort() override;
   bool open(const SerialOptions& opt) override;
+  const std::string& last_error() const { return last_error_; }
   bool isOpen() const override;
   void close() override;
   size_t write(const uint8_t* data, size_t len) override;

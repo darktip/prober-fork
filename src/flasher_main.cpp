@@ -12,6 +12,7 @@
 
 #include <iostream>
 #include <thread>
+#include <chrono>
 #include <cstring>
 #include <algorithm>
 #include <sstream>
@@ -302,6 +303,7 @@ static void emit_port_list_json() {
 }
 
 int main(int argc, char** argv){
+  try {
   auto args = parse_args(argc, argv);
 
   if (args.show_version) {
@@ -777,7 +779,26 @@ int main(int argc, char** argv){
 
   SerialCSerialPort serial; SerialOptions so; so.port = pick_port(log, args.port); so.baud=args.baud; so.timeout_ms=30;
   if (so.port.empty()){ log.info("No serial ports found."); return 1; }
-  if (!serial.open(so)){ log.info(std::string("Could not open ")+so.port); return 1; }
+  bool port_open = serial.open(so);
+  if (!port_open) {
+    log.info("Could not open " + so.port + ": " + serial.last_error() +
+             "; retrying for up to 5 seconds...");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < deadline) {
+      const auto remaining = deadline - std::chrono::steady_clock::now();
+      if (remaining <= std::chrono::steady_clock::duration::zero()) break;
+      std::this_thread::sleep_for(std::min(
+          remaining, std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                         std::chrono::milliseconds(250))));
+      if (std::chrono::steady_clock::now() >= deadline) break;
+      if (serial.open(so)) { port_open = true; break; }
+    }
+    if (!port_open) {
+      log.info("Could not open " + so.port + " after 5 seconds: " + serial.last_error());
+      return 1;
+    }
+    log.info("Serial port became available after retrying.");
+  }
   log.info("Opened "+so.port+" @ "+std::to_string(args.baud)+" baud");
 
   ndjson_emit(args.ui_json,
@@ -1871,4 +1892,8 @@ int main(int argc, char** argv){
               std::string("{\"type\":\"op_done\",\"op\":\"flash\",\"success\":") +
                   (ok_all ? "true" : "false") + "}");
   return ok_all? 0 : 1;
+  } catch (const FourWayLinkLost&) {
+    std::cerr << "4-way communication lost for 5 seconds; stopping retries. Check the FC USB connection.\n";
+    return 1;
+  }
 }

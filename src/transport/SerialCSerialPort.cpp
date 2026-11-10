@@ -3,6 +3,7 @@
 #include <CSerialPort/SerialPortInfo.h>
 #include <thread>
 #include <chrono>
+#include <exception>
 
 using namespace esctool;
 
@@ -10,6 +11,7 @@ SerialCSerialPort::SerialCSerialPort() = default;
 SerialCSerialPort::~SerialCSerialPort() { close(); }
 
 bool SerialCSerialPort::open(const SerialOptions& opt) {
+  last_error_.clear();
   try {
     s_ = std::make_unique<itas109::CSerialPort>();
     s_->init(opt.port.c_str(),
@@ -25,9 +27,18 @@ bool SerialCSerialPort::open(const SerialOptions& opt) {
       last_opts_ = opt;
       return true;
     }
+    const int code = s_->getLastError();
+    const char* message = s_->getLastErrorMsg();
+    last_error_ = std::string(message ? message : "unknown serial error") +
+                  " (serial error " + std::to_string(code) + ")";
+    s_.reset();
+    return false;
+  } catch (const std::exception& e) {
+    last_error_ = e.what();
     s_.reset();
     return false;
   } catch (...) {
+    last_error_ = "unknown serial exception";
     s_.reset();
     return false;
   }
